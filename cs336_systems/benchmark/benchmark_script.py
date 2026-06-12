@@ -28,7 +28,7 @@ def main():
     # 步数配置
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--test_steps", type=int, default=10)
-
+    parser.add_argument("--context_length", type=int, default=None)
     model_configs = [
         {
             "name": "small",
@@ -85,6 +85,9 @@ def main():
     # 初始化模型 **select_cfg: 字典解包语法，把字典的键值对批量转化成关键词参数 
     # *xxx：解包列表 / 元组，用于位置参数
     # **xxx：解包字典，用于关键字参数
+    if args.context_length is not None:
+        select_cfg["context_length"] = args.context_length
+
     model_cfg = {k: v for k, v in select_cfg.items() if k != "name"}
     model = BasicsTransformerLM(**model_cfg)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -149,30 +152,40 @@ def main():
         start = timeit.default_timer()
         if optimizer is not None:
             optimizer.zero_grad()
-        # 纯推理：进入 no_grad 上下文，关闭计算图
         input_seq = dummy_input[:, :-1]
         target_seq = dummy_input[:, 1:]
-        if args.mode == "forward":
-            with torch.no_grad():
+
+        # forward：synchronize 放在区间内部，撑到 GPU kernel 执行完再关闭，
+        # 保证 NVTX 投影与 GPU 对齐（任意 test_steps 都能正确归类）
+        with torch.cuda.nvtx.range("forward"):
+            if args.mode == "forward":
+                with torch.no_grad():
+                    logits = model(input_seq)
+            else:
+                # 反向/训练模式：保留计算图，正常求导
                 logits = model(input_seq)
-        else:
-            # 反向/训练模式：保留计算图，正常求导
-            logits = model(input_seq)
-        if args.mode in ("forward_backward", "full_train"):            
-            loss = cross_entropy(logits.reshape(-1, vocab_size), target_seq.reshape(-1))
-            loss.backward()
+            torch.cuda.synchronize()
+
+        if args.mode in ("forward_backward", "full_train"):
+            with torch.cuda.nvtx.range("loss"):
+                loss = cross_entropy(logits.reshape(-1, vocab_size), target_seq.reshape(-1))
+                torch.cuda.synchronize()
+            with torch.cuda.nvtx.range("backward"):
+                loss.backward()
+                torch.cuda.synchronize()
+
         if args.mode == "full_train":
-            optimizer.step()
+            with torch.cuda.nvtx.range("optimizer.step"):
+                optimizer.step()
+                torch.cuda.synchronize()
 
-        torch.cuda.synchronize()
-
-        # 结束计时，记录耗时
+        # 结束计时，记录耗时（最后一个区间已 synchronize，这里无需再同步）
         end = timeit.default_timer()
         time_records.append(end - start)
 
     # 统计均值、标准差
     avg_time = statistics.mean(time_records)
-    std_time = statistics.stdev(time_records)
+    std_time = statistics.stdev(time_records) if len(time_records) > 1 else 0.0
 
     print(f"Average time per step: {avg_time:.4f} s")
     print(f"Standard deviation: {std_time:.4f} s")
