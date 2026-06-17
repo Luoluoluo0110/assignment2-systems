@@ -1,0 +1,65 @@
+import itertools
+import torch
+from cs336_basics.model import scaled_dot_product_attention
+
+# ============================================================================
+# WSL 卡死的真正根因：CUDA Sysmem Fallback（系统内存回退）。
+# 显存不足时，WSL 的 NVIDIA 驱动默认不报错，而是把超出部分溢出到系统内存，
+# 于是 torch.cuda.OutOfMemoryError 不会抛出 -> except 进不去 -> 系统内存被吃光 -> 整机卡死。
+#
+# 对策：用 set_per_process_memory_fraction 给进程设显存硬上限，
+# 让 PyTorch 在驱动溢出前先抛 OOM，except 才能真正拦住，机器不再冻。
+# 更彻底的办法见文件末尾注释（NVIDIA 控制面板关掉 Sysmem Fallback）。
+# ============================================================================
+
+# 留约 15% 显存给桌面/显示，进程最多用 ~85%，超了立刻干净报 OOM 而不是溢出到内存。
+MEM_FRACTION = 0.85
+
+batch_size = 8
+hidden_dim = [16, 32, 64, 128]
+seq_len = [256, 1024, 4096, 8192, 16384]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+if device.type == "cuda":
+    torch.cuda.set_per_process_memory_fraction(MEM_FRACTION, 0)
+
+
+def bench_one(d_model: int, q_len: int, do_backward: bool = True) -> str:
+    Q = K = V = output = loss = None
+    try:
+        shape = (batch_size, q_len, d_model)
+        Q = torch.randn(shape, device=device, requires_grad=True)
+        K = torch.randn(shape, device=device, requires_grad=True)
+        V = torch.randn(shape, device=device, requires_grad=True)
+
+        torch.cuda.reset_peak_memory_stats()
+        output = scaled_dot_product_attention(Q, K, V)
+        if do_backward:
+            loss = output.sum()
+            loss.backward()
+        torch.cuda.synchronize()
+
+        peak = torch.cuda.max_memory_allocated() / 1024 ** 2
+        return f"d={d_model:>3}, seq={q_len:>5}: peak={peak:8.1f} MiB"
+    except torch.cuda.OutOfMemoryError:
+        return f"d={d_model:>3}, seq={q_len:>5}: OOM (显存不足，已安全跳过)"
+    finally:
+        del Q, K, V, output, loss
+        torch.cuda.empty_cache()
+
+
+def main():
+    if device.type != "cuda":
+        print("WARNING: CUDA 不可用，跑在 CPU 上")
+    for d_model, q_len in itertools.product(hidden_dim, seq_len):
+        print(bench_one(d_model, q_len), flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+# 彻底治本（可选，驱动级，一次设置永久生效）：
+#   NVIDIA 控制面板 -> 管理 3D 设置 -> 程序设置/全局设置
+#   -> 找到 “CUDA - 系统内存回退策略 (Sysmem Fallback Policy)”
+#   -> 改为 “优先不使用系统内存回退 (Prefer No Sysmem Fallback)”
+# 这样显存不够时驱动直接报 OOM，绝不溢出到系统内存，从根上杜绝卡死。

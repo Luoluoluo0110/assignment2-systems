@@ -3,7 +3,9 @@ import timeit
 import statistics
 import torch
 import torch.nn as nn
+import os
 
+from contextlib import nullcontext
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.nn_utils import cross_entropy
@@ -29,6 +31,12 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--test_steps", type=int, default=10)
     parser.add_argument("--context_length", type=int, default=None)
+    parser.add_argument("--bf16", action="store_true", default=None)
+    parser.add_argument("--memory_profile", action="store_true", default=None)
+    parser.add_argument("--profile_step", type=int, default=3)
+    parser.add_argument("--snapshot_dir", type=str, default='.')
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     model_configs = [
         {
             "name": "small",
@@ -79,6 +87,10 @@ def main():
 
     # 解析命令行的参数，将参数值打包成一个对象
     args = parser.parse_args()
+    precision = "bf16" if args.bf16 else "fp32"
+    ctx = torch.autocast(device_type=device, dtype=torch.bfloat16) if args.bf16 else nullcontext()
+    
+
     
     # 遍历model_configs, 如果这个字典的name属性跟model_name一样, next() 作用就是从迭代对象里拿第一个元素 
     select_cfg = next(cfg for cfg in model_configs if cfg["name"] == args.model_name)
@@ -90,9 +102,7 @@ def main():
 
     model_cfg = {k: v for k, v in select_cfg.items() if k != "name"}
     model = BasicsTransformerLM(**model_cfg)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ====================== 实现下面这几块 ======================
     # 4. 移动到设备
     model.to(device)
     if args.mode == "forward":
@@ -125,17 +135,19 @@ def main():
         input_seq = dummy_input[:, :-1]
         target_seq = dummy_input[:, 1:]
         # 纯推理：进入 no_grad 上下文，关闭计算图:
-        if args.mode == "forward":
-            with torch.no_grad():
-        # logits.shape [batch_size, seq_len, vocab_size]
+        with ctx:
+            if args.mode == "forward":
+                with torch.no_grad():
+                    # logits.shape [batch_size, seq_len, vocab_size]
+                    logits = model(input_seq)
+            else:
+                # 反向/训练模式：保留计算图，正常求导
                 logits = model(input_seq)
-        else:
-            # 反向/训练模式：保留计算图，正常求导
-            logits = model(input_seq)
 
         # 但是cross_entropy 传入的是logits是(batch_size * seq_len, vocab_size), target(batch_size * seq_len)
-        if args.mode in ("forward_backward", "full_train"):            
-            loss = cross_entropy(logits.reshape(-1, vocab_size), target_seq.reshape(-1))
+        if args.mode in ("forward_backward", "full_train"):
+            with ctx:            
+                loss = cross_entropy(logits.reshape(-1, vocab_size), target_seq.reshape(-1))
             loss.backward()
         if args.mode == "full_train":
             optimizer.step()
@@ -143,52 +155,118 @@ def main():
         # 【必加】GPU 同步，固定位置
         torch.cuda.synchronize()
 
-    # 8. 正式测速阶段
+    # 分析显存
+    # pytorch 维护一个caching allocator.张量释放，池子里复用
+    if args.memory_profile:
+        # 把池子里空闲的缓存还给 GPU,让起点干净。(注意:它只释放空闲的,正在用的不动。)
+        # allocated:真正被张量占用的量
+        # reserved:PyTorch 向 GPU 要来的池子总量(≥ allocated)
+
+        torch.cuda.empty_cache()
+        # 把"峰值"计数器清零。
+        torch.cuda.reset_peak_memory_stats()
+        # 打开显存时间记录器，最多记100万条事件 
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+        for _ in range(args.profile_step):
+            if optimizer is not None:
+                optimizer.zero_grad()
+            input_seq = dummy_input[:, :-1]
+            target_seq = dummy_input[:, 1:]
+        
+            with ctx:
+                if args.mode == "forward":
+                    with torch.no_grad():
+                        logits = model(input_seq)
+                else:
+                    logits = model(input_seq)
+            # 算loss
+            if args.mode in ("forward_backward", "full_train"):
+                with ctx:
+                    loss = cross_entropy(logits.reshape(-1, vocab_size), target_seq.reshape(-1))
+                loss.backward()
+            # 更新梯度
+            if args.mode == "full_train":
+                optimizer.step()
+        torch.cuda.synchronize()
+        cl = select_cfg["context_length"]
+        fname = f"memsnap_{args.model_name}_ctx{cl}_{args.mode}_{precision}.pickle"
+        os.makedirs(args.snapshot_dir, exist_ok=True)
+        path = os.path.join(args.snapshot_dir, fname)
+        torch.cuda.memory._dump_snapshot(path)
+        torch.cuda.memory._record_memory_history(enabled=None)
+        peak = torch.cuda.max_memory_allocated() / 1024**2               
+        print(f"[MEM {args.model_name} ctx{cl} {args.mode} {precision}] peak={peak:.1f} MiB")
+        return
+
+    # 正式测速阶段
     print(f"Running {args.test_steps} benchmark steps ...")
-    time_records = []  # 存每一轮耗时
+    time_records = []   # 整步耗时
+    fwd_records = []    # 仅 forward 耗时
+    bwd_records = []    # 仅 backward 耗时
 
     for _ in range(args.test_steps):
-        # 开始计时
-        start = timeit.default_timer()
         if optimizer is not None:
             optimizer.zero_grad()
         input_seq = dummy_input[:, :-1]
         target_seq = dummy_input[:, 1:]
 
-        # forward：synchronize 放在区间内部，撑到 GPU kernel 执行完再关闭，
-        # 保证 NVTX 投影与 GPU 对齐（任意 test_steps 都能正确归类）
-        with torch.cuda.nvtx.range("forward"):
-            if args.mode == "forward":
-                with torch.no_grad():
-                    logits = model(input_seq)
-            else:
-                # 反向/训练模式：保留计算图，正常求导
-                logits = model(input_seq)
-            torch.cuda.synchronize()
+        # 整步开始
+        step_start = timeit.default_timer()
 
+        # ---------------- forward（单独计时）----------------
+        # synchronize 放在区间内部，撑到 GPU kernel 执行完再关闭计时
+        fwd_start = timeit.default_timer()
+        with torch.cuda.nvtx.range("forward"):
+            with ctx:
+                if args.mode == "forward":
+                    with torch.no_grad():
+                        logits = model(input_seq)
+                else:
+                    # 反向/训练模式：保留计算图，正常求导
+                    logits = model(input_seq)
+            torch.cuda.synchronize()
+        fwd_records.append(timeit.default_timer() - fwd_start)
+
+        # ---------------- backward（单独计时）----------------
         if args.mode in ("forward_backward", "full_train"):
+            # loss 计算不计入 backward 计时
             with torch.cuda.nvtx.range("loss"):
-                loss = cross_entropy(logits.reshape(-1, vocab_size), target_seq.reshape(-1))
+                with ctx:
+                    loss = cross_entropy(logits.reshape(-1, vocab_size), target_seq.reshape(-1))
                 torch.cuda.synchronize()
+            bwd_start = timeit.default_timer()
             with torch.cuda.nvtx.range("backward"):
                 loss.backward()
                 torch.cuda.synchronize()
+            bwd_records.append(timeit.default_timer() - bwd_start)
 
         if args.mode == "full_train":
             with torch.cuda.nvtx.range("optimizer.step"):
                 optimizer.step()
                 torch.cuda.synchronize()
 
-        # 结束计时，记录耗时（最后一个区间已 synchronize，这里无需再同步）
-        end = timeit.default_timer()
-        time_records.append(end - start)
+        # 整步结束（最后一个区间已 synchronize）
+        time_records.append(timeit.default_timer() - step_start)
 
     # 统计均值、标准差
-    avg_time = statistics.mean(time_records)
-    std_time = statistics.stdev(time_records) if len(time_records) > 1 else 0.0
+    def _stats(xs):
+        if not xs:
+            return float("nan"), float("nan")
+        return statistics.mean(xs), (statistics.stdev(xs) if len(xs) > 1 else 0.0)
 
-    print(f"Average time per step: {avg_time:.4f} s")
-    print(f"Standard deviation: {std_time:.4f} s")
+    fwd_mean, fwd_std = _stats(fwd_records)
+    bwd_mean, bwd_std = _stats(bwd_records)
+    tot_mean, tot_std = _stats(time_records)
+
+    print(f"[{args.model_name} | {precision} | {args.mode}] "
+          f"forward {fwd_mean:.4f}±{fwd_std:.4f}s | "
+          f"backward {bwd_mean:.4f}±{bwd_std:.4f}s | "
+          f"total {tot_mean:.4f}±{tot_std:.4f}s")
+    # 机器可解析的汇总行，供 sweep 脚本收集
+    print(f"RESULT model={args.model_name} precision={precision} mode={args.mode} "
+          f"fwd_mean={fwd_mean:.6f} fwd_std={fwd_std:.6f} "
+          f"bwd_mean={bwd_mean:.6f} bwd_std={bwd_std:.6f} "
+          f"tot_mean={tot_mean:.6f} tot_std={tot_std:.6f}")
 
 
 if __name__ == "__main__":
