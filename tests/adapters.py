@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from cs336_systems.flash_attention import FlashAttention, FlashAttentionTriton
 from cs336_systems.ddp import DDP
-
+from cs336_systems.sharded_optimizer import ShardedOptimizer
 def get_flashattention_autograd_function_pytorch() -> type:
     """
     Returns a torch.autograd.Function subclass that implements FlashAttention2.
@@ -66,7 +66,7 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    
+
     return ddp_model.finish_gradient_synchronization() 
 
 
@@ -134,4 +134,4 @@ def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return ShardedOptimizer(params, optimizer_cls, **kwargs)
